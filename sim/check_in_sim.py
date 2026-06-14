@@ -295,11 +295,34 @@ def jpeg_to_chw(jpeg_bytes: bytes) -> np.ndarray:
     return np.ascontiguousarray(np.transpose(arr, (2, 0, 1)))  # (3, H, W)
 
 
+def policy_images_from_bundle(images: dict, *, send_compressed_images: bool = False) -> dict:
+    """Map bundle camera names to policy camera names.
+
+    By default this preserves the original behavior and sends decoded CHW uint8
+    arrays. With send_compressed_images=True it sends the JPEG bytes stored in
+    the slim bundle directly; patched OpenPI servers decode them on receipt,
+    reducing WAN payload size by roughly 10x.
+    """
+
+    if send_compressed_images:
+        return {
+            "cam_high": images["top_camera"],
+            "cam_left_wrist": images["left_camera"],
+            "cam_right_wrist": images["right_camera"],
+        }
+    return {
+        "cam_high": jpeg_to_chw(images["top_camera"]),
+        "cam_left_wrist": jpeg_to_chw(images["left_camera"]),
+        "cam_right_wrist": jpeg_to_chw(images["right_camera"]),
+    }
+
+
 def run_policy(model, data, viewer, qpos_addrs, ctrl_idxs, bundle, *,
                host: str, port: int, prompt: str,
                api_key: str | None = None,
                action_horizon: int = 10, speed: float = 1.0,
-               ctrl_hz: float = 60.0, realtime: bool = True) -> None:
+               ctrl_hz: float = 60.0, realtime: bool = True,
+               send_compressed_images: bool = False) -> None:
     client = WebsocketPolicyClient(host=host, port=port, api_key=api_key)
     print(f"Connected to policy server at {host}:{port}")
 
@@ -320,11 +343,14 @@ def run_policy(model, data, viewer, qpos_addrs, ctrl_idxs, bundle, *,
         # ---- obs at frame k (mcap JPEG for vision, sim qpos for state) ----
         state14 = read_state14(qpos_addrs, data).astype(np.float64)
         policy_input = {
-            "images": {
-                "cam_high":        jpeg_to_chw(images_top[k]),
-                "cam_left_wrist":  jpeg_to_chw(images_left[k]),
-                "cam_right_wrist": jpeg_to_chw(images_right[k]),
-            },
+            "images": policy_images_from_bundle(
+                {
+                    "top_camera": images_top[k],
+                    "left_camera": images_left[k],
+                    "right_camera": images_right[k],
+                },
+                send_compressed_images=send_compressed_images,
+            ),
             "state":  np.ascontiguousarray(state14),
             "prompt": prompt,
         }
@@ -399,7 +425,8 @@ def run_compare_slim(model, data, viewer, qpos_addrs, ctrl_idxs, bundle, *,
                      action_horizon: int | None = None,
                      speed: float = 1.0,
                      ctrl_hz: float = 60.0, realtime: bool = True,
-                     pause_s: float = 0.5) -> None:
+                     pause_s: float = 0.5,
+                     send_compressed_images: bool = False) -> None:
     """For each sample in a slim bundle (output of make_slim_bundle.py):
 
       1. Snap sim to recorded state, replay the recorded action chunk.
@@ -442,11 +469,7 @@ def run_compare_slim(model, data, viewer, qpos_addrs, ctrl_idxs, bundle, *,
         state_for_policy = np.ascontiguousarray(
             np.asarray(s["state"], dtype=np.float64))
         policy_input = {
-            "images": {
-                "cam_high":        jpeg_to_chw(s["images"]["top_camera"]),
-                "cam_left_wrist":  jpeg_to_chw(s["images"]["left_camera"]),
-                "cam_right_wrist": jpeg_to_chw(s["images"]["right_camera"]),
-            },
+            "images": policy_images_from_bundle(s["images"], send_compressed_images=send_compressed_images),
             "state":  state_for_policy,
             "prompt": prompt,
         }
@@ -510,13 +533,24 @@ def _text_width(draw: ImageDraw.ImageDraw, text: str,
         return draw.textsize(text, font=font)[0]
 
 
+def _format_action_lines(action: np.ndarray) -> list[str]:
+    a = np.asarray(action, dtype=np.float64).flatten()
+    return [
+        f"L_arm:  " + " ".join(f"{a[i]:+.3f}" for i in range(6)),
+        f"L_grip: {a[6]:+.3f}",
+        f"R_arm:  " + " ".join(f"{a[i]:+.3f}" for i in range(7, 13)),
+        f"R_grip: {a[13]:+.3f}",
+    ]
+
+
 class _DualVideoSink:
     """Side-by-side dual-sim mp4 writer for compare mode."""
 
     def __init__(self, model_L: mujoco.MjModel, data_L: mujoco.MjData,
                  model_R: mujoco.MjModel, data_R: mujoco.MjData, *,
                  out_path: Path, camera: str,
-                 panel_width: int, panel_height: int, fps: int):
+                 panel_width: int, panel_height: int, fps: int,
+                 bar_height: int = 100):
         import imageio
         self.data_L, self.data_R = data_L, data_R
         self.camera = camera
@@ -526,6 +560,7 @@ class _DualVideoSink:
         self.frames = 0
         self.panel_width = panel_width
         self.panel_height = panel_height
+        self.bar_height = bar_height
         self.renderer_L = mujoco.Renderer(model_L, height=panel_height, width=panel_width)
         self.renderer_R = mujoco.Renderer(model_R, height=panel_height, width=panel_width)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -536,6 +571,12 @@ class _DualVideoSink:
         self.label_top = ""  # e.g. "sample 3  frame 152"
         self.font_big = _load_overlay_font(max(16, int(panel_height * 0.07)))
         self.font_small = _load_overlay_font(max(14, int(panel_height * 0.05)))
+        _bar_pt = max(10, int(bar_height * 0.11))
+        _bar_info_pt = max(11, int(bar_height * 0.13))
+        self.font_bar = _load_overlay_font(_bar_pt)
+        self.font_bar_info = _load_overlay_font(_bar_info_pt)
+        self._bar_line_h = int(_bar_pt * 1.45)
+        self._bar_info_h = _bar_info_pt
         self._closed = False
         self.out_path = out_path
 
@@ -547,7 +588,11 @@ class _DualVideoSink:
         self.renderer_R.update_scene(self.data_R, camera=self.camera)
         return self.renderer_R.render()
 
-    def _compose(self, frame_L: np.ndarray, frame_R: np.ndarray) -> np.ndarray:
+    def _compose(self, frame_L: np.ndarray, frame_R: np.ndarray,
+                 action_L: np.ndarray | None = None,
+                 action_R: np.ndarray | None = None,
+                 t: int | None = None) -> np.ndarray:
+        # Top: side-by-side renders with labels.
         composite = np.concatenate([frame_L, frame_R], axis=1)
         img = Image.fromarray(composite)
         draw = ImageDraw.Draw(img)
@@ -557,17 +602,66 @@ class _DualVideoSink:
             tw = _text_width(draw, self.label_top, self.font_big)
             x = self.panel_width - tw // 2  # composite center
             _draw_text(draw, self.label_top, (x, 10), self.font_big)
-        return np.asarray(img)
 
-    def write_pair(self, frame_L: np.ndarray, frame_R: np.ndarray) -> None:
-        self.writer.append_data(self._compose(frame_L, frame_R))
+        # Bottom: action value bar.
+        bar_w = self.panel_width * 2
+        bar = np.full((self.bar_height, bar_w, 3), 30, dtype=np.uint8)
+        bar_img = Image.fromarray(bar)
+        bar_draw = ImageDraw.Draw(bar_img)
+
+        # Divider line at the center.
+        xx = self.panel_width
+        for y in range(self.bar_height):
+            bar_img.putpixel((xx, y), (80, 80, 80))
+
+        bar_y_top = 6
+
+        # Left side — REPLAY actions.
+        if action_L is not None:
+            lines = _format_action_lines(action_L)
+            for i, line in enumerate(lines):
+                bar_draw.text((10, bar_y_top + i * self._bar_line_h), line,
+                              font=self.font_bar, fill=(220, 220, 220))
+
+        # Right side — POLICY actions.
+        if action_R is not None:
+            lines = _format_action_lines(action_R)
+            for i, line in enumerate(lines):
+                bar_draw.text((self.panel_width + 10, bar_y_top + i * self._bar_line_h),
+                              line, font=self.font_bar, fill=(220, 220, 220))
+
+        # Info line at bottom of bar (t=...  sample... frame...).
+        info = f"t={t}" if t is not None else ""
+        if info and self.label_top:
+            info_full = f"{info}  {self.label_top}"
+            y_info = self.bar_height - self._bar_info_h - 5
+            # Left half info.
+            bar_draw.text((10, y_info), info_full,
+                          font=self.font_bar_info, fill=(180, 180, 180))
+            # Right half info.
+            bar_draw.text((self.panel_width + 10, y_info), info_full,
+                          font=self.font_bar_info, fill=(180, 180, 180))
+
+        # Stack: top renders + bottom bar.
+        result = np.concatenate([np.asarray(img), np.asarray(bar_img)], axis=0)
+        return np.asarray(result)
+
+    def write_pair(self, frame_L: np.ndarray, frame_R: np.ndarray,
+                   action_L: np.ndarray | None = None,
+                   action_R: np.ndarray | None = None,
+                   t: int | None = None) -> None:
+        self.writer.append_data(
+            self._compose(frame_L, frame_R, action_L, action_R, t))
         self.frames += 1
 
     def write_static(self, frame_L: np.ndarray, frame_R: np.ndarray,
-                     duration_s: float) -> None:
+                     duration_s: float,
+                     action_L: np.ndarray | None = None,
+                     action_R: np.ndarray | None = None,
+                     t: int | None = None) -> None:
         n = max(1, int(round(duration_s * self.fps)))
         for _ in range(n):
-            self.write_pair(frame_L, frame_R)
+            self.write_pair(frame_L, frame_R, action_L, action_R, t)
 
     def __enter__(self):
         return self
@@ -595,7 +689,8 @@ def run_compare_slim_dual_video(scene_path: Path, bundle: dict, *,
                                  panel_width: int, panel_height: int,
                                  fps: int,
                                  ctrl_hz: float = 60.0,
-                                 transition_s: float = 0.8) -> None:
+                                 transition_s: float = 0.8,
+                                 send_compressed_images: bool = False) -> None:
     client = WebsocketPolicyClient(host=host, port=port, api_key=api_key)
     print(f"Connected to policy server at {host}:{port}")
 
@@ -637,17 +732,14 @@ def run_compare_slim_dual_video(scene_path: Path, bundle: dict, *,
             # Title / transition card: hold the pre-roll pose with the label.
             pre_L = sink.render_L()
             pre_R = sink.render_R()
-            sink.write_static(pre_L, pre_R, transition_s)
+            sink.write_static(pre_L, pre_R, transition_s,
+                              action_L=recorded[0], action_R=None, t=0)
 
             # Query policy from the same starting state.
             state_for_policy = np.ascontiguousarray(
                 np.asarray(s["state"], dtype=np.float64))
             policy_input = {
-                "images": {
-                    "cam_high":        jpeg_to_chw(s["images"]["top_camera"]),
-                    "cam_left_wrist":  jpeg_to_chw(s["images"]["left_camera"]),
-                    "cam_right_wrist": jpeg_to_chw(s["images"]["right_camera"]),
-                },
+                "images": policy_images_from_bundle(s["images"], send_compressed_images=send_compressed_images),
                 "state":  state_for_policy,
                 "prompt": prompt,
             }
@@ -685,7 +777,9 @@ def run_compare_slim_dual_video(scene_path: Path, bundle: dict, *,
                     last_L = sink.render_L()
                 if t < H_pol:
                     last_R = sink.render_R()
-                sink.write_pair(last_L, last_R)
+                act_L = recorded[t] if t < H_rec else None
+                act_R = chunk[t] if t < H_pol else None
+                sink.write_pair(last_L, last_R, action_L=act_L, action_R=act_R, t=t)
                 sink.next_t += sink.dt_video
 
     print("\nCompare (dual video) run done.")
@@ -733,6 +827,9 @@ def main() -> None:
                    help="Video framerate (video mode only)")
     p.add_argument("--ctrl-hz",       type=float, default=60.0,
                    help="Control loop frequency in Hz (default 60)")
+    p.add_argument("--send-compressed-images", action="store_true",
+                   help="Send JPEG bytes from the bundle instead of decoded CHW uint8 arrays. "
+                        "Requires a server that advertises accepts_compressed_images.")
     # compare-mode specific
     p.add_argument("--pause-s",       type=float, default=0.5,
                    help="In compare mode (viewer only), seconds to pause between "
@@ -764,6 +861,7 @@ def main() -> None:
             fps=args.fps,
             ctrl_hz=args.ctrl_hz,
             transition_s=max(args.pause_s, 0.0) + 0.3,
+            send_compressed_images=args.send_compressed_images,
         )
         return
 
@@ -797,7 +895,8 @@ def main() -> None:
                        host=args.host, port=args.port, prompt=args.prompt,
                        api_key=args.api_key,
                        action_horizon=args.action_horizon, speed=args.speed,
-                       ctrl_hz=args.ctrl_hz, realtime=realtime)
+                       ctrl_hz=args.ctrl_hz, realtime=realtime,
+                       send_compressed_images=args.send_compressed_images)
         elif args.mode == "compare":
             if "samples" not in bundle:
                 raise SystemExit(
@@ -809,7 +908,8 @@ def main() -> None:
                              action_horizon=None if args.action_horizon <= 0
                                             else args.action_horizon,
                              speed=args.speed, ctrl_hz=args.ctrl_hz,
-                             realtime=realtime, pause_s=args.pause_s)
+                             realtime=realtime, pause_s=args.pause_s,
+                             send_compressed_images=args.send_compressed_images)
 
 
 if __name__ == "__main__":
